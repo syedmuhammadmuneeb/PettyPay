@@ -14,26 +14,41 @@ struct People: View {
     @State private var isPresentingAddPerson: Bool = false
     @State private var isPresentingSelectPeople: Bool = false
 
+    // Items interactions
+    @State private var isEditingItems: Bool = false
+    @State private var assigningItemID: UUID? = nil
+
+    // Summary
+    @State private var isPresentingSummary: Bool = false
+
     // Temporary local state for the mock bill name (no logic elsewhere)
     @State private var billName: String = ""
 
     @EnvironmentObject private var billStore: BillStore
-    @State private var isEditingItems: Bool = false
 
-    // Per-row people picker
-    @State private var itemForPeoplePicker: BillStore.BillItem.ID?
+    // Wrapper used for .sheet(item:)
+    private struct AssignedItemContext: Identifiable {
+        let id: UUID
+        let index: Int
+        let item: BillStore.BillItem
+    }
 
-    // Helper binding to resolve the selected BillItem from its ID.
-    private var selectedBillItemBinding: Binding<BillStore.BillItem?> {
-        Binding<BillStore.BillItem?>(
-            get: {
-                guard let id = itemForPeoplePicker else { return nil }
-                return billStore.items.first(where: { $0.id == id })
-            },
-            set: { newValue in
-                itemForPeoplePicker = newValue?.id
-            }
-        )
+    // MARK: - Palette (fixed order, cycles)
+    private var avatarPalette: [Color] {
+        [
+            Color(hex: 0x708090), // Stone Grey (SlateGray)
+            Color(hex: 0x4B5563), // Grey (dark grayish - Tailwind Gray 600)
+            Color(hex: 0x0B0B0B), // Black (near-black to preserve gradients)
+            Color(hex: 0x4E342E), // Mahogany (dark brown)
+            Color(hex: 0x0B3D2E)  // Pine Tree (very dark green)
+        ]
+    }
+
+    private func nextPaletteColor() -> Color {
+        guard !avatarPalette.isEmpty else { return .blue }
+        // Use total created people to pick next color; cycles with modulo
+        let idx = allPeople.count % avatarPalette.count
+        return avatarPalette[idx]
     }
 
     var body: some View {
@@ -43,12 +58,11 @@ struct People: View {
                            startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
 
-            VStack(spacing: 24) {
+            VStack(spacing: 16) {
 
-                // Mock header: image square + bill name + edit button
+                // Header: image + bill name
                 GlassCard(height: 110) {
                     HStack(spacing: 14) {
-                        // Square placeholder for picture (left side)
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .fill(.thinMaterial)
                             .overlay(
@@ -72,7 +86,6 @@ struct People: View {
                                 }
                             )
 
-                        // Bill info (right side)
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Bill")
                                 .font(.caption)
@@ -84,16 +97,6 @@ struct People: View {
                                     .autocorrectionDisabled()
                                     .font(.headline)
                                     .foregroundStyle(.primary)
-
-                                Button {
-                                    // No logic yet; purely visual
-                                } label: {
-                                    Image(systemName: "pencil.circle.fill")
-                                        .font(.title3)
-                                }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(.primary)
-                                .accessibilityLabel("Edit bill name")
                             }
                         }
 
@@ -101,7 +104,7 @@ struct People: View {
                     }
                 }
 
-                // Top glass bar
+                // Who's joining
                 GlassCard(height: 180) {
                     VStack(spacing: 12) {
                         HStack {
@@ -112,7 +115,6 @@ struct People: View {
                             Spacer()
 
                             HStack(spacing: 10) {
-                                // Edit button (opens selection UI)
                                 Button {
                                     isPresentingSelectPeople = true
                                 } label: {
@@ -122,9 +124,7 @@ struct People: View {
                                 }
                                 .buttonStyle(.plain)
                                 .tint(.primary)
-                                .accessibilityLabel("Edit selected people")
 
-                                // Add button
                                 Button {
                                     isPresentingAddPerson = true
                                 } label: {
@@ -134,11 +134,9 @@ struct People: View {
                                 }
                                 .buttonStyle(.plain)
                                 .tint(.primary)
-                                .accessibilityLabel("Add person")
                             }
                         }
 
-                        // Dynamic avatars
                         if selectedPeople.isEmpty {
                             HStack {
                                 Spacer()
@@ -157,14 +155,22 @@ struct People: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 16) {
                                     ForEach(selectedPeople) { person in
-                                        AvatarBadge(person: person)
-                                            .contextMenu {
-                                                Button(role: .destructive) {
-                                                    removeFromSelected(person)
-                                                } label: {
-                                                    Label("Remove from selection", systemImage: "minus.circle")
-                                                }
+                                        VStack(spacing: 6) {
+                                            AvatarCircle(person: person, size: 44)
+                                            Text(person.name)
+                                                .font(.caption2)
+                                                .lineLimit(1)
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 56)
+                                        }
+                                        .frame(minWidth: 56)
+                                        .contextMenu {
+                                            Button(role: .destructive) {
+                                                removeFromSelected(person)
+                                            } label: {
+                                                Label("Remove from selection", systemImage: "minus.circle")
                                             }
+                                        }
                                     }
                                 }
                                 .padding(.vertical, 4)
@@ -174,179 +180,401 @@ struct People: View {
                     .padding(.top, 8)
                 }
 
-                // Main big card: Items list with custom row layout: name • qty • price • [checkbox] • [+]
-                GlassCard(height: 380) {
-                    VStack(alignment: .leading, spacing: 14) {
-                        HStack {
-                            Text("Items")
-                                .font(.title3.weight(.semibold))
-                                .foregroundStyle(.primary)
+                // Items area fills remaining space and scrolls independently
+                GeometryReader { proxy in
+                    VStack(spacing: 12) {
+                        GlassCard(height: max(300, proxy.size.height - 80)) {
+                            VStack(alignment: .leading, spacing: 14) {
+                                HStack {
+                                    Text("Items")
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(.primary)
 
-                            Spacer()
+                                    Spacer()
 
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    isEditingItems.toggle()
+                                    // Edit toggle
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.15)) {
+                                            isEditingItems.toggle()
+                                        }
+                                    } label: {
+                                        Image(systemName: isEditingItems ? "checkmark.circle.fill" : "pencil.circle")
+                                            .font(.title3)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .tint(.primary)
+                                    .accessibilityLabel(isEditingItems ? "Done Editing Items" : "Edit Items")
                                 }
-                            } label: {
-                                Label(isEditingItems ? "Done" : "Edit", systemImage: isEditingItems ? "checkmark.circle.fill" : "pencil.circle")
-                                    .labelStyle(.iconOnly)
-                                    .font(.title3)
+
+                                if billStore.items.isEmpty {
+                                    VStack(spacing: 8) {
+                                        Text("Scan a bill to see items here")
+                                            .foregroundStyle(.secondary)
+                                            .font(.subheadline)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.bottom, 8)
+                                } else {
+                                    // Header row
+                                    HStack {
+                                        Text("Descrizione")
+                                            .font(.footnote.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Text("Prezzo")
+                                            .font(.footnote.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 100, alignment: .trailing)
+                                        // Keep space for trailing icon to align with rows
+                                        Image(systemName: "person.crop.circle.badge.plus")
+                                            .opacity(0)
+                                            .frame(width: 28)
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.bottom, 4)
+
+                                    // Scrollable items list (not SwiftUI List to keep container static)
+                                    ScrollView(.vertical, showsIndicators: true) {
+                                        LazyVStack(spacing: 10) {
+                                            ForEach(Array(billStore.items.enumerated()), id: \.element.id) { index, item in
+                                                HStack(spacing: 10) {
+                                                    if isEditingItems {
+                                                        // Delete control in edit mode
+                                                        Button(role: .destructive) {
+                                                            deleteItem(at: index)
+                                                        } label: {
+                                                            Image(systemName: "minus.circle.fill")
+                                                                .foregroundStyle(.red)
+                                                                .font(.title3)
+                                                        }
+                                                        .buttonStyle(.plain)
+                                                    }
+
+                                                    // 1) Description (and chips)
+                                                    VStack(alignment: .leading, spacing: 4) {
+                                                        Text(item.name)
+                                                            .foregroundStyle(.primary)
+                                                            .lineLimit(2)
+
+                                                        if !item.assignedPeople.isEmpty {
+                                                            let assigned = selectedPeople.filter { item.assignedPeople.contains($0.id) }
+                                                            if !assigned.isEmpty {
+                                                                ScrollView(.horizontal, showsIndicators: false) {
+                                                                    HStack(spacing: 6) {
+                                                                        ForEach(assigned) { person in
+                                                                            Text(person.initials.uppercased())
+                                                                                .font(.caption2.weight(.semibold))
+                                                                                .padding(.horizontal, 8)
+                                                                                .padding(.vertical, 4)
+                                                                                .background(Capsule().fill(person.color.opacity(0.2)))
+                                                                                .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1))
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                                    // 2) Price
+                                                    Text(formattedPrice(item.price))
+                                                        .font(.subheadline.weight(.semibold))
+                                                        .foregroundStyle(.primary)
+                                                        .frame(width: 100, alignment: .trailing)
+
+                                                    // 3) Assign people button
+                                                    Button {
+                                                        assigningItemID = item.id
+                                                    } label: {
+                                                        Image(systemName: "person.crop.circle.badge.plus")
+                                                            .font(.title3)
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .tint(.primary)
+                                                    .accessibilityLabel("Assign people to item")
+                                                    .frame(width: 28, alignment: .trailing)
+                                                }
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 8)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                        .fill(Color.white.opacity(0.06))
+                                                        .overlay(
+                                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                                        )
+                                                )
+                                            }
+                                        }
+                                        .padding(.horizontal, 4)
+                                        .padding(.bottom, 4)
+                                    }
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .tint(.primary)
-                            .accessibilityLabel("Edit items")
+                            .padding()
                         }
 
-                        if billStore.items.isEmpty {
-                            VStack(spacing: 8) {
-                                Text("Scan a bill to see items here")
-                                    .foregroundStyle(.secondary)
-                                    .font(.subheadline)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.bottom, 8)
-                        } else {
-                            List {
-                                ForEach($billStore.items) { $item in
-                                    HStack(spacing: 12) {
-                                        // Name (leading)
-                                        Text(item.name)
-                                            .lineLimit(2)
-                                            .foregroundStyle(.primary)
-
-                                        Spacer(minLength: 8)
-
-                                        // Quantity
-                                        if isEditingItems {
-                                            Stepper(value: $item.quantity, in: 1...99) {
-                                                Text("x\(item.quantity)")
-                                                    .font(.subheadline)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                            .frame(maxWidth: 160)
-                                        } else {
-                                            Text("x\(item.quantity)")
-                                                .font(.subheadline)
-                                                .foregroundStyle(.secondary)
-                                        }
-
-                                        // Unit Price (trailing-aligned)
-                                        if let price = item.price {
-                                            let currencyCode = Locale.current.currency?.identifier ?? "USD"
-                                            Text(price.formatted(.currency(code: currencyCode)))
-                                                .font(.subheadline.weight(.semibold))
-                                                .foregroundStyle(.primary)
-                                                .frame(minWidth: 80, alignment: .trailing)
-                                        }
-
-                                        // Select checkbox
-                                        Button {
-                                            item.isSelected.toggle()
-                                        } label: {
-                                            Image(systemName: item.isSelected ? "checkmark.square.fill" : "square")
-                                                .foregroundColor(item.isSelected ? .accentColor : .secondary)
-                                                .imageScale(.medium)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .accessibilityLabel(item.isSelected ? "Selected" : "Not selected")
-
-                                        // Assign people
-                                        Button {
-                                            itemForPeoplePicker = item.id
-                                        } label: {
-                                            Image(systemName: "person.crop.circle.badge.plus")
-                                                .imageScale(.medium)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .accessibilityLabel("Assign people")
-                                    }
-                                    .listRowBackground(Color.clear)
-                                    .contentShape(Rectangle())
-                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                        Button(role: .destructive) {
-                                            if let idx = billStore.items.firstIndex(where: { $0.id == item.id }) {
-                                                billStore.items.remove(at: idx)
-                                            }
-                                        } label: {
-                                            Label("Delete", systemImage: "trash")
-                                        }
-                                    }
-                                }
-                                .onMove { indices, newOffset in
-                                    billStore.items.move(fromOffsets: indices, toOffset: newOffset)
-                                }
-                                .onDelete { offsets in
-                                    billStore.items.remove(atOffsets: offsets)
-                                }
-                            }
-                            .listStyle(.plain)
-                            .scrollContentBackground(.hidden)
-                            .background(Color.clear)
-                            .environment(\.editMode, .constant(isEditingItems ? .active : .inactive))
+                        // Modern native button pinned below items area
+                        Button {
+                            isPresentingSummary = true
+                        } label: {
+                            Text("Split")
+                                .frame(maxWidth: .infinity)
                         }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .tint(.black)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [Color.black.opacity(0.95), Color.black.opacity(0.8)],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.bottom, 4)
                     }
-                    .padding()
                 }
-
-                Spacer(minLength: 0)
+                .frame(maxHeight: .infinity) // occupy remaining space
             }
             .padding(.horizontal, 20)
             .padding(.top, 30)
+            .padding(.bottom, 12)
         }
-        // Sheet for adding a person
+        // Add person (minimal sheet: name only, color from palette)
         .sheet(isPresented: $isPresentingAddPerson) {
-            AddPersonView { newPerson in
-                addPerson(newPerson)
+            MinimalAddPersonSheet { name in
+                let color = nextPaletteColor()
+                let person = Person(name: name, color: color)
+                addPerson(person)
             }
             .presentationDetents([.medium])
         }
-        // Sheet for selecting people globally
+        // Select people
         .sheet(isPresented: $isPresentingSelectPeople) {
             SelectPeopleView(allPeople: allPeople, initiallySelected: selectedPeople) { updatedSelection in
                 selectedPeople = updatedSelection
             }
             .presentationDetents([.medium, .large])
         }
-        // Per-row sheet for assigning people to a specific item
-        .sheet(item: selectedBillItemBinding) { boundItem in
-            let initiallySelected = allPeople.filter { boundItem.assignedPeople.contains($0.id) }
-            SelectPeopleView(allPeople: allPeople, initiallySelected: initiallySelected) { updated in
-                if let idx = billStore.items.firstIndex(where: { $0.id == boundItem.id }) {
-                    billStore.items[idx].assignedPeople = Set(updated.map(\.id))
+        // Assign people to item
+        .sheet(item: assigningItemBinding()) { (context: AssignedItemContext) in
+            AssignPeopleSheet(
+                allPeople: selectedPeople, // only allow from joining list
+                assignedIDs: context.item.assignedPeople,
+                onDone: { newAssigned in
+                    updateAssignedPeople(for: context.index, with: newAssigned)
+                    assigningItemID = nil
+                },
+                onCancel: {
+                    assigningItemID = nil
                 }
-            }
+            )
             .presentationDetents([.medium, .large])
         }
+        // Summary
+        .sheet(isPresented: $isPresentingSummary) {
+            let displayTitle = billName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Split" : billName
+            SummarySheetView(title: displayTitle, people: selectedPeople, items: billStore.items)
+                .presentationDetents([.medium, .large])
+        }
+    }
+
+    // MARK: - Helpers (UI formatting)
+
+    private func formattedPrice(_ decimal: Decimal?) -> String {
+        guard let d = decimal else { return "" }
+        let currencyCode = Locale.current.currency?.identifier ?? "EUR"
+        return d.formatted(.currency(code: currencyCode))
     }
 
     // MARK: - Actions
     private func addPerson(_ person: Person) {
         allPeople.append(person)
-        // Optionally auto-select newly added person
         if !selectedPeople.contains(where: { $0.id == person.id }) {
-            selectedPeople.append(person)
-        }
-    }
-
-    private func toggleSelection(for person: Person) {
-        if let idx = selectedPeople.firstIndex(where: { $0.id == person.id }) {
-            selectedPeople.remove(at: idx)
-        } else {
             selectedPeople.append(person)
         }
     }
 
     private func removeFromSelected(_ person: Person) {
         selectedPeople.removeAll { $0.id == person.id }
+        // Also remove from assigned in items
+        for i in billStore.items.indices {
+            billStore.items[i].assignedPeople.remove(person.id)
+        }
     }
 
-    private func deletePeople(at offsets: IndexSet) {
-        let idsToDelete = offsets.map { allPeople[$0].id }
-        allPeople.remove(atOffsets: offsets)
-        selectedPeople.removeAll { idsToDelete.contains($0.id) }
+    private func deleteItem(at index: Int) {
+        guard billStore.items.indices.contains(index) else { return }
+        billStore.items.remove(at: index)
+    }
+
+    private func updateAssignedPeople(for index: Int, with newAssigned: Set<UUID>) {
+        guard billStore.items.indices.contains(index) else { return }
+        billStore.items[index].assignedPeople = newAssigned
+    }
+
+    // Binding helper to present sheet for assigning item
+    private func assigningItemBinding() -> Binding<AssignedItemContext?> {
+        Binding<AssignedItemContext?>(
+            get: {
+                guard let id = assigningItemID,
+                      let idx = billStore.items.firstIndex(where: { $0.id == id }) else { return nil }
+                let item = billStore.items[idx]
+                return AssignedItemContext(id: id, index: idx, item: item)
+            },
+            set: { newValue in
+                if newValue == nil {
+                    assigningItemID = nil
+                }
+            }
+        )
     }
 }
 
-// ... (rest of file unchanged)
+// MARK: - Minimal Add Person Sheet (name only; color assigned by parent)
 
+private struct MinimalAddPersonSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String = ""
+
+    // Now returns just the name; parent assigns color from palette
+    let onAdd: (String) -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Details") {
+                    TextField("Name", text: $name)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                }
+            }
+            .navigationTitle("Add Person")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add") {
+                        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        onAdd(trimmed)
+                        dismiss()
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Assign People Sheet
+
+private struct AssignPeopleSheet: View {
+    let allPeople: [Person] // pool to select from (those who joined)
+    @State var assignedIDs: Set<UUID>
+    var onDone: (Set<UUID>) -> Void
+    var onCancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(allPeople) { person in
+                    HStack {
+                        AvatarCircle(person: person, size: 28)
+                        Text(person.name)
+                        Spacer()
+                        if assignedIDs.contains(person.id) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        toggle(person.id)
+                    }
+                }
+            }
+            .navigationTitle("Assign People")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { onCancel() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { onDone(assignedIDs) }
+                }
+            }
+        }
+    }
+
+    private func toggle(_ id: UUID) {
+        if assignedIDs.contains(id) {
+            assignedIDs.remove(id)
+        } else {
+            assignedIDs.insert(id)
+        }
+    }
+}
+
+// MARK: - Summary Sheet
+
+private struct SummarySheetView: View {
+    let title: String
+    let people: [Person]
+    let items: [BillStore.BillItem]
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Per Person Totals") {
+                    ForEach(people) { person in
+                        let total = totalFor(personID: person.id)
+                        HStack {
+                            AvatarCircle(person: person, size: 28)
+                            Text(person.name)
+                            Spacer()
+                            Text(formattedPrice(total))
+                                .font(.body.weight(.semibold))
+                        }
+                    }
+                }
+
+                Section("Unassigned Items") {
+                    ForEach(items.filter { $0.assignedPeople.isEmpty }) { item in
+                        HStack {
+                            Text(item.name)
+                            Spacer()
+                            Text(formattedPrice(item.price))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .navigationTitle(title)
+        }
+    }
+
+    private func totalFor(personID: UUID) -> Decimal {
+        var sum = Decimal(0)
+        for item in items {
+            guard let price = item.price else { continue }
+            guard !item.assignedPeople.isEmpty else { continue }
+            if item.assignedPeople.contains(personID) {
+                let share = price / Decimal(item.assignedPeople.count)
+                sum += share
+            }
+        }
+        return sum
+    }
+
+    private func formattedPrice(_ decimal: Decimal?) -> String {
+        guard let d = decimal else { return "" }
+        let currencyCode = Locale.current.currency?.identifier ?? "EUR"
+        return d.formatted(.currency(code: currencyCode))
+    }
+}
